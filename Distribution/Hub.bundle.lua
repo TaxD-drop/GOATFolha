@@ -56,8 +56,7 @@ local __config = (function()
 
         FEATURES = table.freeze({
             COLLECT_BATCH_SIZE = 25,
-            COLLECT_RADIUS = 8,
-            SELL_AT_CAPACITY_RATIO = 1,
+            COLLECT_MAX_PENDING = 75,
             UPGRADE_ORDER = table.freeze({
                 "Capacity",
                 "Yield",
@@ -71,11 +70,18 @@ local __config = (function()
             }),
         }),
 
+        PLAYER = table.freeze({
+            DEFAULT_WALK_SPEED = 16,
+            MIN_WALK_SPEED = 0,
+            MAX_WALK_SPEED = 100,
+            DEFAULT_JUMP_HEIGHT = 7.2,
+            MIN_JUMP_HEIGHT = 0,
+            MAX_JUMP_HEIGHT = 100,
+        }),
+
         TIMING = table.freeze({
             COLLECT_MIN_POLL = 0.05,
-            SELL_POLL = 0.50,
-            SELL_CONFIRM_TIMEOUT = 15,
-            SELL_RETRY_DELAY = 2,
+            COLLECT_CONFIRM_TIMEOUT = 1.5,
             UPGRADE_POLL = 0.50,
             UPGRADE_CONFIRM_TIMEOUT = 2,
             REBIRTH_POLL = 1,
@@ -819,7 +825,6 @@ __factories["Features/AutoCollect"] = function()
 
     local Players = game:GetService("Players")
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local Workspace = game:GetService("Workspace")
 
     local AutoCollect = {}
     AutoCollect.__index = AutoCollect
@@ -840,6 +845,11 @@ __factories["Features/AutoCollect"] = function()
             enabled = false,
             generation = 0,
             onStatus = onStatus or function() end,
+            acknowledgementConnection = nil,
+            leafData = nil,
+            scanCursor = 1,
+            pendingByIndex = {},
+            pendingOrder = {},
         }, AutoCollect)
     end
 
@@ -853,7 +863,244 @@ __factories["Features/AutoCollect"] = function()
         return valueOf(player:FindFirstChild("leaderstats"), "Rebirth", 0) >= requiredRebirth
     end
 
-    function AutoCollect:_collectBatch(player, leafData, pickupManager, leafFolder, remote)
+    function AutoCollect:_clearPending()
+        table.clear(self.pendingByIndex)
+        table.clear(self.pendingOrder)
+    end
+
+    function AutoCollect:_expirePending(now)
+        for position = #self.pendingOrder, 1, -1 do
+            local pending = self.pendingOrder[position]
+            if now - pending.sentAt >= Config.TIMING.COLLECT_CONFIRM_TIMEOUT then
+                self.pendingByIndex[pending.index] = nil
+                table.remove(self.pendingOrder, position)
+            end
+        end
+    end
+
+    function AutoCollect:_confirmAccepted(results)
+        if not self.enabled or typeof(results) ~= "table" or not self.leafData then
+            return
+        end
+
+        local confirmed = 0
+        for _, accepted in ipairs(results) do
+            local areaName = typeof(accepted) == "table" and accepted.AreaName or nil
+            if typeof(areaName) == "string" then
+                for position, pending in ipairs(self.pendingOrder) do
+                    if pending.areaName == areaName then
+                        table.remove(self.pendingOrder, position)
+                        self.pendingByIndex[pending.index] = nil
+                        local info = self.leafData.leaves[pending.index]
+                        if info and not info.pickedUp then
+                            -- O servidor nao devolve LeafIndex. Os retornos preservam
+                            -- a ordem por area observada nos logs; so agora removemos
+                            -- a folha local que recebeu confirmacao.
+                            self.leafData.MarkPickedUp(pending.index)
+                        end
+                        confirmed += 1
+                        break
+                    end
+                end
+            end
+        end
+        if confirmed > 0 then
+            self.onStatus("Servidor confirmou " .. tostring(confirmed) .. " folhas")
+        end
+    end
+
+    function AutoCollect:_collectBatch(player, leafData, remote)
+        local playerData = player:FindFirstChild("PlayerData")
+        local activeTool = player:GetAttribute("ActiveTool")
+        if not playerData
+            or player:GetAttribute("IsSelling")
+            or player:GetAttribute("IsRaking")
+            or player:GetAttribute("IsBlowing")
+            or activeTool == "Rake"
+            or activeTool == "Blower"
+        then
+            return 0
+        end
+
+        self:_expirePending(os.clock())
+        local pendingSlots = Config.FEATURES.COLLECT_MAX_PENDING - #self.pendingOrder
+        if pendingSlots <= 0 then return 0 end
+
+        local leavesHeld = valueOf(playerData, "Leaves", 0)
+        local maxHold = valueOf(playerData, "MaxHold", 0)
+        local infinite = valueOf(playerData, "InfiniteCapacityExpiry", 0) > os.time()
+        local capacityLeft = if infinite then math.huge else math.max(0, maxHold - leavesHeld)
+        if capacityLeft <= 0 then return 0 end
+
+        local limit = math.min(Config.FEATURES.COLLECT_BATCH_SIZE, pendingSlots, capacityLeft)
+        local luckChance = math.clamp(
+            valueOf(playerData, "RealLuckChance", 0) + valueOf(playerData, "BasementLuckyBonus", 0),
+            0,
+            1
+        )
+        local batch = {}
+        local pendingBatch = {}
+        local sentAt = os.clock()
+        local totalLeaves = #leafData.leaves
+        for offset = 0, totalLeaves - 1 do
+            if #batch >= limit then break end
+            local index = ((self.scanCursor + offset - 1) % totalLeaves) + 1
+            local leaf = leafData.leaves[index]
+            if leaf and not leaf.pickedUp and leaf.cframe and not self.pendingByIndex[index] then
+                local areaName = leaf.areaName or "Unknown"
+                if self:_areaUnlocked(player, areaName) then
+                    table.insert(batch, {
+                        AreaName = areaName,
+                        IsLucky = math.random() <= luckChance,
+                        LeafIndex = index,
+                        Position = leaf.cframe.Position,
+                    })
+                    table.insert(pendingBatch, {
+                        index = index,
+                        areaName = areaName,
+                        sentAt = sentAt,
+                    })
+                    self.scanCursor = index % totalLeaves + 1
+                end
+            end
+        end
+        if #batch == 0 then return 0 end
+
+        -- Registra antes do envio para nao perder uma resposta muito rapida.
+        for _, pending in ipairs(pendingBatch) do
+            self.pendingByIndex[pending.index] = pending
+            table.insert(self.pendingOrder, pending)
+        end
+        local ok, message = pcall(function()
+            remote:FireServer(batch)
+        end)
+        if not ok then
+            for _, pending in ipairs(pendingBatch) do
+                self.pendingByIndex[pending.index] = nil
+                local position = table.find(self.pendingOrder, pending)
+                if position then table.remove(self.pendingOrder, position) end
+            end
+            error(message)
+        end
+        return #batch
+    end
+
+    function AutoCollect:_disconnectAcknowledgement()
+        if self.acknowledgementConnection then
+            self.acknowledgementConnection:Disconnect()
+            self.acknowledgementConnection = nil
+        end
+    end
+
+    function AutoCollect:_run(generation)
+        local player = Players.LocalPlayer
+        local modules = ReplicatedStorage:WaitForChild("Modules", 10)
+        local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+        local leafDataModule = modules and modules:WaitForChild("LeafData", 10)
+        local remote = remotes and remotes:WaitForChild("LeafPickedUp", 10)
+        if not self.enabled or self.generation ~= generation then return end
+        if not leafDataModule or not remote or not remote:IsA("RemoteEvent") then
+            self.onStatus("Coleta: dependencias ausentes")
+            self:setEnabled(false)
+            return
+        end
+
+        self.leafData = require(leafDataModule)
+        self.scanCursor = 1
+        self:_disconnectAcknowledgement()
+        self:_clearPending()
+        self.acknowledgementConnection = remote.OnClientEvent:Connect(function(results)
+            local ok, message = pcall(function()
+                self:_confirmAccepted(results)
+            end)
+            if not ok then self.onStatus("Confirmacao da coleta falhou: " .. tostring(message)) end
+        end)
+
+        self.onStatus("Auto Collect amplo ativo (confirmacao do servidor)")
+        while self.enabled and self.generation == generation do
+            local ok, result = pcall(function()
+                return self:_collectBatch(player, self.leafData, remote)
+            end)
+            if not ok then
+                self.onStatus("Coleta falhou: " .. tostring(result))
+            elseif result > 0 then
+                self.onStatus("Enviadas " .. tostring(result) .. " folhas; aguardando servidor")
+            end
+            task.wait(Config.TIMING.COLLECT_MIN_POLL)
+        end
+
+        if self.generation == generation then
+            self:_disconnectAcknowledgement()
+            self:_clearPending()
+            self.leafData = nil
+        end
+    end
+
+    function AutoCollect:setEnabled(enabled)
+        enabled = enabled == true
+        if self.enabled == enabled then return end
+        self.enabled = enabled
+        self.generation += 1
+        if enabled then
+            local generation = self.generation
+            task.spawn(function() self:_run(generation) end)
+        else
+            self:_disconnectAcknowledgement()
+            self:_clearPending()
+            self.leafData = nil
+            self.onStatus("Auto Collect desativado")
+        end
+    end
+
+    function AutoCollect:stop()
+        self:setEnabled(false)
+    end
+
+    return AutoCollect
+end
+
+__factories["Features/AutoCollectSafe"] = function()
+    -- Backup da coleta local validada em 2026-08-06.
+    -- Este modulo nao e carregado pelo Hub; ele preserva a versao conservadora
+    -- de raio 8 para restauracao rapida caso o modo amplo precise ser revertido.
+    local Config = __require("Config")
+
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Workspace = game:GetService("Workspace")
+
+    local AutoCollectSafe = {}
+    AutoCollectSafe.__index = AutoCollectSafe
+
+    local REBIRTH_UNLOCKS = {
+        Playground = 5,
+        Skatepark = 10,
+        Court = 25,
+    }
+
+    local function valueOf(parent, name, fallback)
+        local object = parent and parent:FindFirstChild(name)
+        return object and object.Value or fallback
+    end
+
+    function AutoCollectSafe.new(onStatus)
+        return setmetatable({
+            enabled = false,
+            generation = 0,
+            onStatus = onStatus or function() end,
+        }, AutoCollectSafe)
+    end
+
+    function AutoCollectSafe:_areaUnlocked(player, areaName)
+        local requiredRebirth = REBIRTH_UNLOCKS[areaName]
+        if not requiredRebirth then return true end
+        local hiddenData = player:FindFirstChild("HiddenData")
+        local unlockedDoors = hiddenData and hiddenData:FindFirstChild("UnlockedDoors")
+        if unlockedDoors and unlockedDoors:FindFirstChild(areaName) then return true end
+        return valueOf(player:FindFirstChild("leaderstats"), "Rebirth", 0) >= requiredRebirth
+    end
+
+    function AutoCollectSafe:_collectBatch(player, leafData, pickupManager, leafFolder, remote)
         local playerData = player:FindFirstChild("PlayerData")
         local character = player.Character
         local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -884,8 +1131,8 @@ __factories["Features/AutoCollect"] = function()
                 local areaName = leaf:GetAttribute("AreaName") or "Unknown"
                 local index = leaf:GetAttribute("LeafIndex")
                 local info = index and leafData.leaves[index]
-                if distance <= Config.FEATURES.COLLECT_RADIUS
-                    and info and not info.pickedUp and self:_areaUnlocked(player, areaName)
+                if distance <= 8 and info and not info.pickedUp
+                    and self:_areaUnlocked(player, areaName)
                 then
                     table.insert(candidates, {
                         instance = leaf,
@@ -920,8 +1167,6 @@ __factories["Features/AutoCollect"] = function()
         if #batch == 0 then return 0, cooldown end
 
         remote:FireServer(batch)
-        -- Replica o fluxo original apenas para folhas dentro do raio aceito.
-        -- Folhas distantes nunca sao marcadas/destruidas localmente.
         for _, candidate in ipairs(selected) do
             pickupManager.ClearLeafState(candidate.instance)
             leafData.MarkPickedUp(candidate.index)
@@ -929,7 +1174,7 @@ __factories["Features/AutoCollect"] = function()
         return #batch, cooldown
     end
 
-    function AutoCollect:_run(generation)
+    function AutoCollectSafe:_run(generation)
         local player = Players.LocalPlayer
         local modules = ReplicatedStorage:WaitForChild("Modules", 10)
         local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
@@ -940,20 +1185,20 @@ __factories["Features/AutoCollect"] = function()
         if not leafFolder or not leafDataModule or not pickupModule
             or not remote or not remote:IsA("RemoteEvent")
         then
-            self.onStatus("Coleta: dependencias ausentes")
+            self.onStatus("Coleta segura: dependencias ausentes")
             self:setEnabled(false)
             return
         end
 
         local leafData = require(leafDataModule)
         local pickupManager = require(pickupModule)
-        self.onStatus("Auto Collect local (raio 8) ativo")
+        self.onStatus("Auto Collect seguro (raio 8) ativo")
         while self.enabled and self.generation == generation do
             local ok, result, waitTime = pcall(function()
                 return self:_collectBatch(player, leafData, pickupManager, leafFolder, remote)
             end)
             if not ok then
-                self.onStatus("Coleta falhou: " .. tostring(result))
+                self.onStatus("Coleta segura falhou: " .. tostring(result))
             elseif result > 0 then
                 self.onStatus("Coletadas " .. tostring(result) .. " folhas proximas")
             end
@@ -961,7 +1206,7 @@ __factories["Features/AutoCollect"] = function()
         end
     end
 
-    function AutoCollect:setEnabled(enabled)
+    function AutoCollectSafe:setEnabled(enabled)
         enabled = enabled == true
         if self.enabled == enabled then return end
         self.enabled = enabled
@@ -970,15 +1215,15 @@ __factories["Features/AutoCollect"] = function()
             local generation = self.generation
             task.spawn(function() self:_run(generation) end)
         else
-            self.onStatus("Auto Collect desativado")
+            self.onStatus("Auto Collect seguro desativado")
         end
     end
 
-    function AutoCollect:stop()
+    function AutoCollectSafe:stop()
         self:setEnabled(false)
     end
 
-    return AutoCollect
+    return AutoCollectSafe
 end
 
 __factories["Features/AutoRebirth"] = function()
@@ -1084,162 +1329,6 @@ __factories["Features/AutoRebirth"] = function()
     end
 
     return AutoRebirth
-end
-
-__factories["Features/AutoSell"] = function()
-    local Config = __require("Config")
-
-    local Players = game:GetService("Players")
-    local Workspace = game:GetService("Workspace")
-
-    local AutoSell = {}
-    AutoSell.__index = AutoSell
-
-    local function valueOf(parent, name, fallback)
-        local object = parent and parent:FindFirstChild(name)
-        return object and object.Value or fallback
-    end
-
-    local function promptPosition(prompt)
-        local object = prompt.Parent
-        while object and not object:IsA("BasePart") do
-            object = object.Parent
-        end
-        return object and object.Position or nil
-    end
-
-    local function nearestSellPrompt(root)
-        local zones = Workspace:FindFirstChild("SellZones")
-        if not zones then return nil, nil end
-        local best, bestDistance
-        for _, object in ipairs(zones:GetDescendants()) do
-            if object:IsA("ProximityPrompt") and object.Enabled then
-                local position = promptPosition(object)
-                if position then
-                    local distance = (root.Position - position).Magnitude
-                    if not bestDistance or distance < bestDistance then
-                        best, bestDistance = object, distance
-                    end
-                end
-            end
-        end
-        return best, bestDistance
-    end
-
-    local function executorPromptTrigger()
-        if typeof(fireproximityprompt) == "function" then return fireproximityprompt end
-        local env = if typeof(getgenv) == "function" then getgenv() else _G
-        if typeof(env) == "table" and typeof(env.fireproximityprompt) == "function" then
-            return env.fireproximityprompt
-        end
-        return nil
-    end
-
-    function AutoSell.new(onStatus)
-        return setmetatable({
-            enabled = false,
-            generation = 0,
-            onStatus = onStatus or function() end,
-        }, AutoSell)
-    end
-
-    function AutoSell:_shouldSell(player)
-        local playerData = player:FindFirstChild("PlayerData")
-        local leaves = valueOf(playerData, "Leaves", 0)
-        local maxHold = valueOf(playerData, "MaxHold", 0)
-        return leaves > 0 and maxHold > 0
-            and leaves >= maxHold * Config.FEATURES.SELL_AT_CAPACITY_RATIO
-    end
-
-    function AutoSell:_activatePrompt(prompt, distance, generation)
-        local trigger = executorPromptTrigger()
-        if trigger then
-            local ok, message = pcall(trigger, prompt)
-            return ok, message
-        end
-
-        if distance > prompt.MaxActivationDistance then
-            return false, "aproxime-se da lixeira"
-        end
-        prompt:InputHoldBegin()
-        local deadline = os.clock() + math.max(0, prompt.HoldDuration)
-        while self.enabled and self.generation == generation and os.clock() < deadline do
-            task.wait(0.05)
-        end
-        prompt:InputHoldEnd()
-        if not self.enabled or self.generation ~= generation then
-            return false, "cancelado"
-        end
-        return true
-    end
-
-    function AutoSell:_requestSell(player, generation)
-        local playerData = player:FindFirstChild("PlayerData")
-        local character = player.Character
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-        if not root then return false end
-
-        local prompt, distance = nearestSellPrompt(root)
-        if not prompt then
-            self.onStatus("Auto Sell: prompt da lixeira ausente")
-            return false
-        end
-        local leavesBefore = valueOf(playerData, "Leaves", 0)
-        local activated, reason = self:_activatePrompt(prompt, distance, generation)
-        if not activated then
-            self.onStatus("Auto Sell: " .. tostring(reason))
-            return false
-        end
-
-        self.onStatus("Auto Sell: prompt acionado")
-        local deadline = os.clock() + Config.TIMING.SELL_CONFIRM_TIMEOUT
-        repeat
-            task.wait(0.1)
-            if valueOf(playerData, "Leaves", 0) < leavesBefore then
-                self.onStatus("Auto Sell: venda confirmada")
-                return true
-            end
-        until not self.enabled or self.generation ~= generation or os.clock() >= deadline
-
-        if self.enabled and self.generation == generation then
-            self.onStatus("Auto Sell: servidor nao confirmou")
-        end
-        return false
-    end
-
-
-    function AutoSell:_run(generation)
-        local player = Players.LocalPlayer
-        self.onStatus("Auto Sell por ProximityPrompt ativo")
-        while self.enabled and self.generation == generation do
-            if not player:GetAttribute("IsSelling") and self:_shouldSell(player) then
-                local ok, result = pcall(function() return self:_requestSell(player, generation) end)
-                if not ok then self.onStatus("Venda falhou: " .. tostring(result)) end
-                task.wait(Config.TIMING.SELL_RETRY_DELAY)
-            else
-                task.wait(Config.TIMING.SELL_POLL)
-            end
-        end
-    end
-
-    function AutoSell:setEnabled(enabled)
-        enabled = enabled == true
-        if self.enabled == enabled then return end
-        self.enabled = enabled
-        self.generation += 1
-        if enabled then
-            local generation = self.generation
-            task.spawn(function() self:_run(generation) end)
-        else
-            self.onStatus("Auto Sell desativado")
-        end
-    end
-
-    function AutoSell:stop()
-        self:setEnabled(false)
-    end
-
-    return AutoSell
 end
 
 __factories["Features/AutoUpgrade"] = function()
@@ -1370,6 +1459,173 @@ __factories["Features/AutoUpgrade"] = function()
     end
 
     return AutoUpgrade
+end
+
+__factories["Features/PlayerOverrides"] = function()
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+
+    local Config = __require("Config")
+
+    local PlayerOverrides = {}
+    PlayerOverrides.__index = PlayerOverrides
+
+    local function getHumanoid(player)
+        local character = player.Character
+        return character and character:FindFirstChildOfClass("Humanoid") or nil
+    end
+
+    local function clamp(value, minimum, maximum, fallback)
+        return math.clamp(tonumber(value) or fallback, minimum, maximum)
+    end
+
+    function PlayerOverrides.new(onStatus)
+        local player = Players.LocalPlayer
+        local humanoid = getHumanoid(player)
+        local self = setmetatable({
+            player = player,
+            onStatus = onStatus or function() end,
+            walkSpeed = humanoid and humanoid.WalkSpeed or Config.PLAYER.DEFAULT_WALK_SPEED,
+            jump = humanoid and (humanoid.UseJumpPower and humanoid.JumpPower or humanoid.JumpHeight)
+                or Config.PLAYER.DEFAULT_JUMP_HEIGHT,
+            walkSpeedEnabled = false,
+            jumpEnabled = false,
+            originals = setmetatable({}, { __mode = "k" }),
+            connections = {},
+            destroyed = false,
+            writing = false,
+        }, PlayerOverrides)
+
+        table.insert(self.connections, player.CharacterAdded:Connect(function(character)
+            local nextHumanoid = character:WaitForChild("Humanoid", 10)
+            if nextHumanoid and nextHumanoid:IsA("Humanoid") then
+                self:_capture(nextHumanoid)
+                self:_enforce()
+            end
+        end))
+        table.insert(self.connections, RunService.Stepped:Connect(function()
+            self:_enforce()
+        end))
+        return self
+    end
+
+    function PlayerOverrides:_capture(humanoid)
+        if not humanoid or not humanoid.Parent or self.originals[humanoid] then return end
+        self.originals[humanoid] = {
+            walkSpeed = humanoid.WalkSpeed,
+            jumpPower = humanoid.JumpPower,
+            jumpHeight = humanoid.JumpHeight,
+        }
+    end
+
+    function PlayerOverrides:_enforce()
+        if self.destroyed or self.writing then return end
+        local humanoid = getHumanoid(self.player)
+        if not humanoid then return end
+        self:_capture(humanoid)
+
+        self.writing = true
+        if self.walkSpeedEnabled and humanoid.WalkSpeed ~= self.walkSpeed then
+            humanoid.WalkSpeed = self.walkSpeed
+        end
+        if self.jumpEnabled then
+            if humanoid.UseJumpPower then
+                if humanoid.JumpPower ~= self.jump then humanoid.JumpPower = self.jump end
+            elseif humanoid.JumpHeight ~= self.jump then
+                humanoid.JumpHeight = self.jump
+            end
+        end
+        self.writing = false
+    end
+
+    function PlayerOverrides:_restore(property)
+        self.writing = true
+        for humanoid, original in pairs(self.originals) do
+            if humanoid.Parent then
+                if property == "walkSpeed" then
+                    humanoid.WalkSpeed = original.walkSpeed
+                else
+                    humanoid.JumpPower = original.jumpPower
+                    humanoid.JumpHeight = original.jumpHeight
+                end
+            end
+        end
+        self.writing = false
+    end
+
+    function PlayerOverrides:getWalkSpeed()
+        return self.walkSpeed
+    end
+
+    function PlayerOverrides:setWalkSpeed(value)
+        self.walkSpeed = clamp(
+            value,
+            Config.PLAYER.MIN_WALK_SPEED,
+            Config.PLAYER.MAX_WALK_SPEED,
+            Config.PLAYER.DEFAULT_WALK_SPEED
+        )
+        self:_enforce()
+        return self.walkSpeed
+    end
+
+    function PlayerOverrides:getJump()
+        return self.jump
+    end
+
+    function PlayerOverrides:setJump(value)
+        self.jump = clamp(
+            value,
+            Config.PLAYER.MIN_JUMP_HEIGHT,
+            Config.PLAYER.MAX_JUMP_HEIGHT,
+            Config.PLAYER.DEFAULT_JUMP_HEIGHT
+        )
+        self:_enforce()
+        return self.jump
+    end
+
+    function PlayerOverrides:setWalkSpeedEnabled(enabled)
+        enabled = enabled == true
+        if self.walkSpeedEnabled == enabled then return end
+        self.walkSpeedEnabled = enabled
+        if enabled then
+            self:_capture(getHumanoid(self.player))
+            self:_enforce()
+            self.onStatus("WalkSpeed ativo: " .. tostring(math.floor(self.walkSpeed + 0.5)))
+        else
+            self:_restore("walkSpeed")
+            self.onStatus("WalkSpeed restaurado")
+        end
+    end
+
+    function PlayerOverrides:setJumpEnabled(enabled)
+        enabled = enabled == true
+        if self.jumpEnabled == enabled then return end
+        self.jumpEnabled = enabled
+        if enabled then
+            self:_capture(getHumanoid(self.player))
+            self:_enforce()
+            self.onStatus("Pulo ativo: " .. tostring(math.floor(self.jump + 0.5)))
+        else
+            self:_restore("jump")
+            self.onStatus("Pulo restaurado")
+        end
+    end
+
+    function PlayerOverrides:stop()
+        self:setWalkSpeedEnabled(false)
+        self:setJumpEnabled(false)
+    end
+
+    function PlayerOverrides:Destroy()
+        if self.destroyed then return end
+        self:stop()
+        self.destroyed = true
+        for _, connection in ipairs(self.connections) do connection:Disconnect() end
+        table.clear(self.connections)
+        table.clear(self.originals)
+    end
+
+    return PlayerOverrides
 end
 
 __factories["UI/Layout"] = function()
@@ -1794,12 +2050,12 @@ __factories["UI/LegacyUI"] = function()
         table.insert(self.connections, Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
             self:_bindCamera()
         end))
-        table.insert(self.connections, closeButton.Activated:Connect(function()
+        table.insert(self.connections, closeButton.MouseButton1Click:Connect(function()
             if self.closeCallback then
                 self.closeCallback()
             end
         end))
-        table.insert(self.connections, minimizeButton.Activated:Connect(function()
+        table.insert(self.connections, minimizeButton.MouseButton1Click:Connect(function()
             local currentHeight = self.frame.Size.Y.Offset
             local top = self.frame.Position.Y.Offset - currentHeight / 2
             self.collapsed = not self.collapsed
@@ -1900,7 +2156,7 @@ __factories["UI/LegacyUI"] = function()
         end
         render()
 
-        row.Activated:Connect(function()
+        row.MouseButton1Click:Connect(function()
             checked = not checked
             render()
             callback(checked)
@@ -1951,7 +2207,6 @@ end
 
 __factories["UI/ModernUI"] = function()
     local Players = game:GetService("Players")
-    local TweenService = game:GetService("TweenService")
     local UserInputService = game:GetService("UserInputService")
     local Workspace = game:GetService("Workspace")
 
@@ -1965,7 +2220,6 @@ __factories["UI/ModernUI"] = function()
     local COLORS = Theme.resolveColors(Theme.DEFAULT_NAME)
 
     local TABS = table.freeze({ "Main", "Visual", "Misc", "Settings" })
-    local TWEEN_INFO = TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
     local THEME_ATTRIBUTE = "GOATHubTheme_"
     local THEME_PROPERTIES = table.freeze({
         "BackgroundColor3",
@@ -2028,7 +2282,11 @@ __factories["UI/ModernUI"] = function()
     end
 
     local function animate(instance, properties)
-        TweenService:Create(instance, TWEEN_INFO, properties):Play()
+        -- Alguns executores moveis mantem Activated/hover como um gesto continuo.
+        -- Aplicacao atomica evita animacoes disparadas por toques fora do alvo.
+        for property, value in pairs(properties) do
+            instance[property] = value
+        end
     end
 
     local function animateThemed(instance, property, token)
@@ -2310,7 +2568,7 @@ __factories["UI/ModernUI"] = function()
                 indicator = indicator,
             }
             self.pages[pageName] = page
-            table.insert(self.connections, button.Activated:Connect(function()
+            table.insert(self.connections, button.MouseButton1Click:Connect(function()
                 self:selectPage(pageName)
             end))
         end
@@ -2533,7 +2791,7 @@ __factories["UI/ModernUI"] = function()
         table.insert(self.connections, Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
             self:_bindCamera()
         end))
-        table.insert(self.connections, closeButton.Activated:Connect(function()
+        table.insert(self.connections, closeButton.MouseButton1Click:Connect(function()
             if self.closeCallback then
                 self.closeCallback()
             end
@@ -2614,10 +2872,10 @@ __factories["UI/ModernUI"] = function()
             self:_applyLayout(false)
         end
 
-        table.insert(self.connections, minimizeButton.Activated:Connect(function()
+        table.insert(self.connections, minimizeButton.MouseButton1Click:Connect(function()
             collapseToLogo()
         end))
-        table.insert(self.connections, brand.Activated:Connect(function()
+        table.insert(self.connections, brand.MouseButton1Click:Connect(function()
             if self.collapsed and os.clock() >= (self.suppressBrandUntil or 0) then
                 self.dragState = "idle"
                 self.dragKind = nil
@@ -2786,7 +3044,7 @@ __factories["UI/ModernUI"] = function()
         row.MouseLeave:Connect(function()
             animateThemed(row, "BackgroundColor3", "card")
         end)
-        row.Activated:Connect(function()
+        row.MouseButton1Click:Connect(function()
             checked = not checked
             render(true)
             callback(checked)
@@ -2865,7 +3123,7 @@ __factories["UI/ModernUI"] = function()
             button.Parent = selector
             corner(button, 7)
             buttons[value] = button
-            button.Activated:Connect(function()
+            button.MouseButton1Click:Connect(function()
                 if selected == value then
                     return
                 end
@@ -3090,7 +3348,7 @@ __factories["UI/ModernUI"] = function()
             button.Parent = tokenList
             corner(button, 7)
             tokenButtons[currentToken] = button
-            button.Activated:Connect(function()
+            button.MouseButton1Click:Connect(function()
                 selectToken(currentToken)
             end)
         end
@@ -3248,9 +3506,9 @@ __factories["init"] = function()
     local StateStore = __require("Core/StateStore")
     local Theme = __require("Core/Theme")
     local AutoCollect = __require("Features/AutoCollect")
-    local AutoSell = __require("Features/AutoSell")
     local AutoRebirth = __require("Features/AutoRebirth")
     local AutoUpgrade = __require("Features/AutoUpgrade")
+    local PlayerOverrides = __require("Features/PlayerOverrides")
 
     local UI
     if Config.UI_STYLE == "Legacy" then
@@ -3276,6 +3534,7 @@ __factories["init"] = function()
         end
 
         local stateStore = StateStore.new()
+        stateStore:remove("feature.autoSell")
         local executorSettings = ExecutorSettings.new()
         local savedTheme = executorSettings:getTheme()
         local uiConfig = Config.UI_STYLE == "Legacy" and Config.UI or Config.MODERN_UI
@@ -3326,15 +3585,14 @@ __factories["init"] = function()
 
         local controllers = {
             autoCollect = AutoCollect.new(setStatus),
-            autoSell = AutoSell.new(setStatus),
             autoRebirth = AutoRebirth.new(setStatus),
             autoUpgrade = AutoUpgrade.new(setStatus),
+            playerOverrides = PlayerOverrides.new(setStatus),
         }
         app.controllers = controllers
 
         local controls = {
             { key = "feature.autoCollect", label = "Auto Collect Leaves", controller = controllers.autoCollect },
-            { key = "feature.autoSell", label = "Auto Sell (capacidade cheia)", controller = controllers.autoSell },
             { key = "feature.autoUpgrade", label = "Auto Upgrade Items", controller = controllers.autoUpgrade },
             { key = "feature.autoRebirth", label = "Auto Rebirth", controller = controllers.autoRebirth },
         }
@@ -3348,10 +3606,69 @@ __factories["init"] = function()
         end
 
         contentItem(UI.section(mainPage, "COMPORTAMENTO"))
-        contentItem(UI.info(mainPage, "Collect usa os lotes reais de LeafData. Sell usa o marcador remoto observado, sem teleporte. Upgrade compra o item disponivel mais barato. Rebirth so envia com os requisitos completos.", 82))
+        contentItem(UI.info(mainPage, "Collect envia lotes amplos de LeafData e so remove uma folha depois da confirmacao do servidor. Upgrade compra o item disponivel mais barato. Rebirth so envia com os requisitos completos.", 82))
 
         contentItem(UI.section(visualPage, "VISUAL"))
         contentItem(UI.section(miscPage, "MISC"))
+        contentItem(UI.section(miscPage, "PLAYER"))
+
+        local savedWalkSpeed = stateStore:getNumber(
+            "value.walkSpeed",
+            controllers.playerOverrides:getWalkSpeed(),
+            Config.PLAYER.MIN_WALK_SPEED,
+            Config.PLAYER.MAX_WALK_SPEED
+        )
+        controllers.playerOverrides:setWalkSpeed(savedWalkSpeed)
+        contentItem(UI.numberInput(
+            miscPage,
+            "Velocidade (WalkSpeed)",
+            savedWalkSpeed,
+            Config.PLAYER.MIN_WALK_SPEED,
+            Config.PLAYER.MAX_WALK_SPEED,
+            function(value)
+                local applied = controllers.playerOverrides:setWalkSpeed(value)
+                stateStore:setNumber(
+                    "value.walkSpeed",
+                    applied,
+                    Config.PLAYER.MIN_WALK_SPEED,
+                    Config.PLAYER.MAX_WALK_SPEED
+                )
+            end
+        ))
+        local walkSpeedEnabled = stateStore:getBoolean("feature.walkSpeedOverride", false)
+        contentItem(UI.checkbox(miscPage, "Fixar WalkSpeed", walkSpeedEnabled, function(enabled)
+            stateStore:setBoolean("feature.walkSpeedOverride", enabled)
+            controllers.playerOverrides:setWalkSpeedEnabled(enabled)
+        end))
+
+        local savedJump = stateStore:getNumber(
+            "value.jump",
+            controllers.playerOverrides:getJump(),
+            Config.PLAYER.MIN_JUMP_HEIGHT,
+            Config.PLAYER.MAX_JUMP_HEIGHT
+        )
+        controllers.playerOverrides:setJump(savedJump)
+        contentItem(UI.numberInput(
+            miscPage,
+            "Pulo (JumpPower / JumpHeight)",
+            savedJump,
+            Config.PLAYER.MIN_JUMP_HEIGHT,
+            Config.PLAYER.MAX_JUMP_HEIGHT,
+            function(value)
+                local applied = controllers.playerOverrides:setJump(value)
+                stateStore:setNumber(
+                    "value.jump",
+                    applied,
+                    Config.PLAYER.MIN_JUMP_HEIGHT,
+                    Config.PLAYER.MAX_JUMP_HEIGHT
+                )
+            end
+        ))
+        local jumpEnabled = stateStore:getBoolean("feature.jumpOverride", false)
+        contentItem(UI.checkbox(miscPage, "Fixar pulo", jumpEnabled, function(enabled)
+            stateStore:setBoolean("feature.jumpOverride", enabled)
+            controllers.playerOverrides:setJumpEnabled(enabled)
+        end))
 
         contentItem(UI.section(settingsPage, "INTERFACE"))
         if typeof(UI.segmented) == "function" and typeof(window.setScalePercent) == "function" then
@@ -3415,7 +3732,14 @@ __factories["init"] = function()
             end
             self.destroyed = true
             for _, controller in pairs(controllers) do
-                controller:stop()
+                local ok, message = pcall(function()
+                    if typeof(controller.Destroy) == "function" then
+                        controller:Destroy()
+                    else
+                        controller:stop()
+                    end
+                end)
+                if not ok then warn("[GOATFolha Hub] Falha ao encerrar controller: " .. tostring(message)) end
             end
             stateStore:flush()
             window:Destroy()
@@ -3430,6 +3754,8 @@ __factories["init"] = function()
         for _, control in ipairs(controls) do
             control.controller:setEnabled(control.initial)
         end
+        controllers.playerOverrides:setWalkSpeedEnabled(walkSpeedEnabled)
+        controllers.playerOverrides:setJumpEnabled(jumpEnabled)
         setStatus("Pronto")
         return app
     end
