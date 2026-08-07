@@ -55,8 +55,8 @@ local __config = (function()
         }),
 
         FEATURES = table.freeze({
-            COLLECT_BATCH_SIZE = 25,
-            COLLECT_MAX_PENDING = 75,
+            COLLECT_BATCH_SIZE = 50,
+            COLLECT_MAX_PENDING = 4096,
             UPGRADE_ORDER = table.freeze({
                 "Capacity",
                 "Yield",
@@ -80,8 +80,8 @@ local __config = (function()
         }),
 
         TIMING = table.freeze({
-            COLLECT_MIN_POLL = 0.05,
-            COLLECT_CONFIRM_TIMEOUT = 1.5,
+            COLLECT_MIN_POLL = 0.03,
+            COLLECT_CONFIRM_TIMEOUT = 1,
             UPGRADE_POLL = 0.50,
             UPGRADE_CONFIRM_TIMEOUT = 2,
             REBIRTH_POLL = 1,
@@ -850,6 +850,8 @@ __factories["Features/AutoCollect"] = function()
             scanCursor = 1,
             pendingByIndex = {},
             pendingOrder = {},
+            pendingHead = 1,
+            pendingCount = 0,
         }, AutoCollect)
     end
 
@@ -866,15 +868,33 @@ __factories["Features/AutoCollect"] = function()
     function AutoCollect:_clearPending()
         table.clear(self.pendingByIndex)
         table.clear(self.pendingOrder)
+        self.pendingHead = 1
+        self.pendingCount = 0
     end
 
     function AutoCollect:_expirePending(now)
-        for position = #self.pendingOrder, 1, -1 do
-            local pending = self.pendingOrder[position]
-            if now - pending.sentAt >= Config.TIMING.COLLECT_CONFIRM_TIMEOUT then
+        while self.pendingHead <= #self.pendingOrder do
+            local pending = self.pendingOrder[self.pendingHead]
+            if pending.consumed then
+                self.pendingHead += 1
+            elseif now - pending.sentAt >= Config.TIMING.COLLECT_CONFIRM_TIMEOUT then
+                pending.consumed = true
                 self.pendingByIndex[pending.index] = nil
-                table.remove(self.pendingOrder, position)
+                self.pendingCount -= 1
+                self.pendingHead += 1
+            else
+                break
             end
+        end
+
+        if self.pendingHead > 1024 then
+            local compacted = {}
+            for position = self.pendingHead, #self.pendingOrder do
+                local pending = self.pendingOrder[position]
+                if not pending.consumed then table.insert(compacted, pending) end
+            end
+            self.pendingOrder = compacted
+            self.pendingHead = 1
         end
     end
 
@@ -887,10 +907,12 @@ __factories["Features/AutoCollect"] = function()
         for _, accepted in ipairs(results) do
             local areaName = typeof(accepted) == "table" and accepted.AreaName or nil
             if typeof(areaName) == "string" then
-                for position, pending in ipairs(self.pendingOrder) do
-                    if pending.areaName == areaName then
-                        table.remove(self.pendingOrder, position)
+                for position = self.pendingHead, #self.pendingOrder do
+                    local pending = self.pendingOrder[position]
+                    if not pending.consumed and pending.areaName == areaName then
+                        pending.consumed = true
                         self.pendingByIndex[pending.index] = nil
+                        self.pendingCount -= 1
                         local info = self.leafData.leaves[pending.index]
                         if info and not info.pickedUp then
                             -- O servidor nao devolve LeafIndex. Os retornos preservam
@@ -923,7 +945,7 @@ __factories["Features/AutoCollect"] = function()
         end
 
         self:_expirePending(os.clock())
-        local pendingSlots = Config.FEATURES.COLLECT_MAX_PENDING - #self.pendingOrder
+        local pendingSlots = Config.FEATURES.COLLECT_MAX_PENDING - self.pendingCount
         if pendingSlots <= 0 then return 0 end
 
         local leavesHeld = valueOf(playerData, "Leaves", 0)
@@ -959,6 +981,7 @@ __factories["Features/AutoCollect"] = function()
                         index = index,
                         areaName = areaName,
                         sentAt = sentAt,
+                        consumed = false,
                     })
                     self.scanCursor = index % totalLeaves + 1
                 end
@@ -970,15 +993,18 @@ __factories["Features/AutoCollect"] = function()
         for _, pending in ipairs(pendingBatch) do
             self.pendingByIndex[pending.index] = pending
             table.insert(self.pendingOrder, pending)
+            self.pendingCount += 1
         end
         local ok, message = pcall(function()
             remote:FireServer(batch)
         end)
         if not ok then
             for _, pending in ipairs(pendingBatch) do
-                self.pendingByIndex[pending.index] = nil
-                local position = table.find(self.pendingOrder, pending)
-                if position then table.remove(self.pendingOrder, position) end
+                if not pending.consumed then
+                    pending.consumed = true
+                    self.pendingByIndex[pending.index] = nil
+                    self.pendingCount -= 1
+                end
             end
             error(message)
         end
@@ -1023,8 +1049,6 @@ __factories["Features/AutoCollect"] = function()
             end)
             if not ok then
                 self.onStatus("Coleta falhou: " .. tostring(result))
-            elseif result > 0 then
-                self.onStatus("Enviadas " .. tostring(result) .. " folhas; aguardando servidor")
             end
             task.wait(Config.TIMING.COLLECT_MIN_POLL)
         end
@@ -2337,7 +2361,6 @@ __factories["UI/ModernUI"] = function()
         local self = {
             colors = COLORS,
             connections = {},
-            cameraConnection = nil,
             destroyed = false,
             closeCallback = nil,
             collapsed = false,
@@ -2470,6 +2493,7 @@ __factories["UI/ModernUI"] = function()
         minimizeButton.Size = UDim2.fromOffset(34, 30)
         themed(minimizeButton, "BackgroundColor3", "surface")
         minimizeButton.Text = "–"
+        minimizeButton.AutoButtonColor = false
         themed(minimizeButton, "TextColor3", "muted")
         minimizeButton.Font = Enum.Font.GothamBold
         minimizeButton.TextSize = 19
@@ -2486,6 +2510,7 @@ __factories["UI/ModernUI"] = function()
         closeButton.Size = UDim2.fromOffset(34, 30)
         themed(closeButton, "BackgroundColor3", "surface")
         closeButton.Text = "×"
+        closeButton.AutoButtonColor = false
         themed(closeButton, "TextColor3", "red")
         closeButton.Font = Enum.Font.GothamBold
         closeButton.TextSize = 19
@@ -2707,20 +2732,6 @@ __factories["UI/ModernUI"] = function()
             self:selectPage(self.activePage)
         end
 
-        function self:_bindCamera()
-            if self.cameraConnection then
-                self.cameraConnection:Disconnect()
-                self.cameraConnection = nil
-            end
-            local camera = Workspace.CurrentCamera
-            if camera then
-                self.cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-                    self:_applyLayout(false)
-                end)
-            end
-            self:_applyLayout(false)
-        end
-
         local function finishDrag(input)
             local finishedMouse = self.dragKind == "mouse"
                 and input.UserInputType == Enum.UserInputType.MouseButton1
@@ -2788,9 +2799,6 @@ __factories["UI/ModernUI"] = function()
         end))
 
         table.insert(self.connections, UserInputService.InputEnded:Connect(finishDrag))
-        table.insert(self.connections, Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-            self:_bindCamera()
-        end))
         table.insert(self.connections, closeButton.MouseButton1Click:Connect(function()
             if self.closeCallback then
                 self.closeCallback()
@@ -2900,10 +2908,6 @@ __factories["UI/ModernUI"] = function()
             self.dragState = "idle"
             self.dragKind = nil
             self.dragInput = nil
-            if self.cameraConnection then
-                self.cameraConnection:Disconnect()
-                self.cameraConnection = nil
-            end
             for _, connection in ipairs(self.connections) do
                 connection:Disconnect()
             end
@@ -2917,7 +2921,6 @@ __factories["UI/ModernUI"] = function()
         end
 
         self:_applyLayout(true)
-        self:_bindCamera()
         self:selectPage("Main")
         return self
     end
@@ -2980,16 +2983,6 @@ __factories["UI/ModernUI"] = function()
         corner(button, 10)
         stroke(button, "border", 1, 0.2)
 
-        button.MouseEnter:Connect(function()
-            if not color then
-                animateThemed(button, "BackgroundColor3", "cardHover")
-            end
-        end)
-        button.MouseLeave:Connect(function()
-            if not color then
-                animateThemed(button, "BackgroundColor3", "card")
-            end
-        end)
         return button
     end
 
@@ -3038,12 +3031,6 @@ __factories["UI/ModernUI"] = function()
         end
         render(false)
 
-        row.MouseEnter:Connect(function()
-            animateThemed(row, "BackgroundColor3", "cardHover")
-        end)
-        row.MouseLeave:Connect(function()
-            animateThemed(row, "BackgroundColor3", "card")
-        end)
         row.MouseButton1Click:Connect(function()
             checked = not checked
             render(true)
