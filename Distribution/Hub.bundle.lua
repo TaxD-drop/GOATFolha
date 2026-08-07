@@ -56,6 +56,7 @@ local __config = (function()
 
         FEATURES = table.freeze({
             COLLECT_BATCH_SIZE = 25,
+            COLLECT_RADIUS = 8,
             SELL_AT_CAPACITY_RATIO = 1,
             UPGRADE_ORDER = table.freeze({
                 "Capacity",
@@ -71,10 +72,10 @@ local __config = (function()
         }),
 
         TIMING = table.freeze({
-            COLLECT_POLL = 0.20,
+            COLLECT_MIN_POLL = 0.05,
             SELL_POLL = 0.50,
-            SELL_CONFIRM_TIMEOUT = 2,
-            SELL_RETRY_DELAY = 1,
+            SELL_CONFIRM_TIMEOUT = 15,
+            SELL_RETRY_DELAY = 2,
             UPGRADE_POLL = 0.50,
             UPGRADE_CONFIRM_TIMEOUT = 2,
             REBIRTH_POLL = 1,
@@ -818,6 +819,7 @@ __factories["Features/AutoCollect"] = function()
 
     local Players = game:GetService("Players")
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Workspace = game:GetService("Workspace")
 
     local AutoCollect = {}
     AutoCollect.__index = AutoCollect
@@ -843,90 +845,119 @@ __factories["Features/AutoCollect"] = function()
 
     function AutoCollect:_areaUnlocked(player, areaName)
         local requiredRebirth = REBIRTH_UNLOCKS[areaName]
-        if not requiredRebirth then
-            return true
-        end
+        if not requiredRebirth then return true end
 
         local hiddenData = player:FindFirstChild("HiddenData")
         local unlockedDoors = hiddenData and hiddenData:FindFirstChild("UnlockedDoors")
-        if unlockedDoors and unlockedDoors:FindFirstChild(areaName) then
-            return true
-        end
-
-        local leaderstats = player:FindFirstChild("leaderstats")
-        return valueOf(leaderstats, "Rebirth", 0) >= requiredRebirth
+        if unlockedDoors and unlockedDoors:FindFirstChild(areaName) then return true end
+        return valueOf(player:FindFirstChild("leaderstats"), "Rebirth", 0) >= requiredRebirth
     end
 
-    function AutoCollect:_collectBatch(player, leafData, remote)
+    function AutoCollect:_collectBatch(player, leafData, pickupManager, leafFolder, remote)
         local playerData = player:FindFirstChild("PlayerData")
-        if not playerData or player:GetAttribute("IsSelling") then
-            return 0
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local activeTool = player:GetAttribute("ActiveTool")
+        if not playerData or not root
+            or player:GetAttribute("IsSelling")
+            or player:GetAttribute("IsRaking")
+            or player:GetAttribute("IsBlowing")
+            or activeTool == "Rake"
+            or activeTool == "Blower"
+        then
+            return 0, Config.TIMING.COLLECT_MIN_POLL
         end
 
         local leavesHeld = valueOf(playerData, "Leaves", 0)
         local maxHold = valueOf(playerData, "MaxHold", 0)
-        local infiniteExpiry = valueOf(playerData, "InfiniteCapacityExpiry", 0)
-        local remaining = if infiniteExpiry > os.time() then math.huge else math.max(0, maxHold - leavesHeld)
-        if remaining <= 0 then
-            return 0
-        end
+        local infinite = valueOf(playerData, "InfiniteCapacityExpiry", 0) > os.time()
+        local remaining = if infinite then math.huge else math.max(0, maxHold - leavesHeld)
+        local cooldown = math.max(Config.TIMING.COLLECT_MIN_POLL, valueOf(playerData, "Cooldown", 0.5))
+        if remaining <= 0 then return 0, cooldown end
 
-        local luckChance = math.max(0, valueOf(playerData, "RealLuckChance", 0)
-            + valueOf(playerData, "BasementLuckyBonus", 0))
-        local limit = math.min(Config.FEATURES.COLLECT_BATCH_SIZE, remaining)
+        local yield = math.max(1, valueOf(playerData, "Yield", 1))
+        local limit = math.min(Config.FEATURES.COLLECT_BATCH_SIZE, yield, remaining)
+        local candidates = {}
+        for _, leaf in ipairs(leafFolder:GetChildren()) do
+            if leaf:IsA("BasePart") and leaf.Transparency < 1 then
+                local distance = (root.Position - leaf.Position).Magnitude
+                local areaName = leaf:GetAttribute("AreaName") or "Unknown"
+                local index = leaf:GetAttribute("LeafIndex")
+                local info = index and leafData.leaves[index]
+                if distance <= Config.FEATURES.COLLECT_RADIUS
+                    and info and not info.pickedUp and self:_areaUnlocked(player, areaName)
+                then
+                    table.insert(candidates, {
+                        instance = leaf,
+                        index = index,
+                        areaName = areaName,
+                        distance = distance,
+                    })
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a.distance < b.distance end)
+
+        local luckChance = math.clamp(
+            valueOf(playerData, "RealLuckChance", 0) + valueOf(playerData, "BasementLuckyBonus", 0),
+            0,
+            1
+        )
         local batch = {}
-        local indexes = {}
-
-        for index, leaf in ipairs(leafData.leaves) do
-            if #batch >= limit then
-                break
-            end
-            if not leaf.pickedUp and leaf.cframe and self:_areaUnlocked(player, leaf.areaName) then
+        local selected = {}
+        for index = 1, math.min(limit, #candidates) do
+            local candidate = candidates[index]
+            if candidate.instance.Parent and candidate.instance.Transparency < 1 then
                 table.insert(batch, {
-                    AreaName = leaf.areaName or "Unknown",
+                    AreaName = candidate.areaName,
                     IsLucky = math.random() <= luckChance,
-                    LeafIndex = index,
-                    Position = leaf.cframe.Position,
+                    LeafIndex = candidate.index,
+                    Position = candidate.instance.CFrame.Position,
                 })
-                table.insert(indexes, index)
+                table.insert(selected, candidate)
             end
         end
-
-        if #batch == 0 then
-            return 0
-        end
+        if #batch == 0 then return 0, cooldown end
 
         remote:FireServer(batch)
-        for _, index in ipairs(indexes) do
-            leafData.MarkPickedUp(index)
+        -- Replica o fluxo original apenas para folhas dentro do raio aceito.
+        -- Folhas distantes nunca sao marcadas/destruidas localmente.
+        for _, candidate in ipairs(selected) do
+            pickupManager.ClearLeafState(candidate.instance)
+            leafData.MarkPickedUp(candidate.index)
         end
-        return #batch
+        return #batch, cooldown
     end
 
     function AutoCollect:_run(generation)
         local player = Players.LocalPlayer
         local modules = ReplicatedStorage:WaitForChild("Modules", 10)
         local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+        local leafFolder = Workspace:WaitForChild("LeafFolder", 10)
         local leafDataModule = modules and modules:WaitForChild("LeafData", 10)
+        local pickupModule = modules and modules:WaitForChild("LeafPickupManager", 10)
         local remote = remotes and remotes:WaitForChild("LeafPickedUp", 10)
-        if not leafDataModule or not remote or not remote:IsA("RemoteEvent") then
+        if not leafFolder or not leafDataModule or not pickupModule
+            or not remote or not remote:IsA("RemoteEvent")
+        then
             self.onStatus("Coleta: dependencias ausentes")
             self:setEnabled(false)
             return
         end
 
         local leafData = require(leafDataModule)
-        self.onStatus("Auto Collect ativo")
+        local pickupManager = require(pickupModule)
+        self.onStatus("Auto Collect local (raio 8) ativo")
         while self.enabled and self.generation == generation do
-            local ok, result = pcall(function()
-                return self:_collectBatch(player, leafData, remote)
+            local ok, result, waitTime = pcall(function()
+                return self:_collectBatch(player, leafData, pickupManager, leafFolder, remote)
             end)
             if not ok then
                 self.onStatus("Coleta falhou: " .. tostring(result))
             elseif result > 0 then
-                self.onStatus("Coletadas " .. tostring(result) .. " folhas")
+                self.onStatus("Coletadas " .. tostring(result) .. " folhas proximas")
             end
-            task.wait(Config.TIMING.COLLECT_POLL)
+            task.wait(waitTime or Config.TIMING.COLLECT_MIN_POLL)
         end
     end
 
@@ -1059,7 +1090,7 @@ __factories["Features/AutoSell"] = function()
     local Config = __require("Config")
 
     local Players = game:GetService("Players")
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Workspace = game:GetService("Workspace")
 
     local AutoSell = {}
     AutoSell.__index = AutoSell
@@ -1067,6 +1098,41 @@ __factories["Features/AutoSell"] = function()
     local function valueOf(parent, name, fallback)
         local object = parent and parent:FindFirstChild(name)
         return object and object.Value or fallback
+    end
+
+    local function promptPosition(prompt)
+        local object = prompt.Parent
+        while object and not object:IsA("BasePart") do
+            object = object.Parent
+        end
+        return object and object.Position or nil
+    end
+
+    local function nearestSellPrompt(root)
+        local zones = Workspace:FindFirstChild("SellZones")
+        if not zones then return nil, nil end
+        local best, bestDistance
+        for _, object in ipairs(zones:GetDescendants()) do
+            if object:IsA("ProximityPrompt") and object.Enabled then
+                local position = promptPosition(object)
+                if position then
+                    local distance = (root.Position - position).Magnitude
+                    if not bestDistance or distance < bestDistance then
+                        best, bestDistance = object, distance
+                    end
+                end
+            end
+        end
+        return best, bestDistance
+    end
+
+    local function executorPromptTrigger()
+        if typeof(fireproximityprompt) == "function" then return fireproximityprompt end
+        local env = if typeof(getgenv) == "function" then getgenv() else _G
+        if typeof(env) == "table" and typeof(env.fireproximityprompt) == "function" then
+            return env.fireproximityprompt
+        end
+        return nil
     end
 
     function AutoSell.new(onStatus)
@@ -1085,20 +1151,51 @@ __factories["Features/AutoSell"] = function()
             and leaves >= maxHold * Config.FEATURES.SELL_AT_CAPACITY_RATIO
     end
 
-    function AutoSell:_requestSell(player, remote, generation)
+    function AutoSell:_activatePrompt(prompt, distance, generation)
+        local trigger = executorPromptTrigger()
+        if trigger then
+            local ok, message = pcall(trigger, prompt)
+            return ok, message
+        end
+
+        if distance > prompt.MaxActivationDistance then
+            return false, "aproxime-se da lixeira"
+        end
+        prompt:InputHoldBegin()
+        local deadline = os.clock() + math.max(0, prompt.HoldDuration)
+        while self.enabled and self.generation == generation and os.clock() < deadline do
+            task.wait(0.05)
+        end
+        prompt:InputHoldEnd()
+        if not self.enabled or self.generation ~= generation then
+            return false, "cancelado"
+        end
+        return true
+    end
+
+    function AutoSell:_requestSell(player, generation)
         local playerData = player:FindFirstChild("PlayerData")
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root then return false end
+
+        local prompt, distance = nearestSellPrompt(root)
+        if not prompt then
+            self.onStatus("Auto Sell: prompt da lixeira ausente")
+            return false
+        end
         local leavesBefore = valueOf(playerData, "Leaves", 0)
+        local activated, reason = self:_activatePrompt(prompt, distance, generation)
+        if not activated then
+            self.onStatus("Auto Sell: " .. tostring(reason))
+            return false
+        end
 
-        -- Nos oito ciclos capturados, SellVisuals encerra a venda com math.huge.
-        -- Usar somente esse marcador evita inventar os valores parciais calculados
-        -- a partir dos oito argumentos que o servidor envia ao cliente.
-        remote:FireServer(math.huge)
-
+        self.onStatus("Auto Sell: prompt acionado")
         local deadline = os.clock() + Config.TIMING.SELL_CONFIRM_TIMEOUT
         repeat
             task.wait(0.1)
-            local leavesNow = valueOf(playerData, "Leaves", 0)
-            if leavesNow < leavesBefore then
+            if valueOf(playerData, "Leaves", 0) < leavesBefore then
                 self.onStatus("Auto Sell: venda confirmada")
                 return true
             end
@@ -1110,24 +1207,14 @@ __factories["Features/AutoSell"] = function()
         return false
     end
 
+
     function AutoSell:_run(generation)
         local player = Players.LocalPlayer
-        local remote = ReplicatedStorage:WaitForChild("SellLeavesEvent", 10)
-        if not remote or not remote:IsA("RemoteEvent") then
-            self.onStatus("Venda: SellLeavesEvent ausente")
-            self:setEnabled(false)
-            return
-        end
-
-        self.onStatus("Auto Sell remoto ativo")
+        self.onStatus("Auto Sell por ProximityPrompt ativo")
         while self.enabled and self.generation == generation do
-            if self:_shouldSell(player) then
-                local ok, result = pcall(function()
-                    return self:_requestSell(player, remote, generation)
-                end)
-                if not ok then
-                    self.onStatus("Venda falhou: " .. tostring(result))
-                end
+            if not player:GetAttribute("IsSelling") and self:_shouldSell(player) then
+                local ok, result = pcall(function() return self:_requestSell(player, generation) end)
+                if not ok then self.onStatus("Venda falhou: " .. tostring(result)) end
                 task.wait(Config.TIMING.SELL_RETRY_DELAY)
             else
                 task.wait(Config.TIMING.SELL_POLL)
