@@ -57,14 +57,26 @@ local __config = (function()
         FEATURES = table.freeze({
             COLLECT_BATCH_SIZE = 25,
             SELL_AT_CAPACITY_RATIO = 1,
-            SELL_TOUCH_OFFSET = 2.5,
+            UPGRADE_ORDER = table.freeze({
+                "Capacity",
+                "Yield",
+                "Cooldown",
+                "RakeSpeed",
+                "RakeArea",
+                "RakeRange",
+                "BlowerRange",
+                "BlowerRadius",
+                "BlowerCooldown",
+            }),
         }),
 
         TIMING = table.freeze({
             COLLECT_POLL = 0.20,
             SELL_POLL = 0.50,
-            SELL_TRIGGER_WAIT = 0.45,
-            SELL_TIMEOUT = 12,
+            SELL_CONFIRM_TIMEOUT = 2,
+            SELL_RETRY_DELAY = 1,
+            UPGRADE_POLL = 0.50,
+            UPGRADE_CONFIRM_TIMEOUT = 2,
             REBIRTH_POLL = 1,
             REBIRTH_CONFIRM_TIMEOUT = 5,
         }),
@@ -1048,7 +1060,6 @@ __factories["Features/AutoSell"] = function()
 
     local Players = game:GetService("Players")
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local Workspace = game:GetService("Workspace")
 
     local AutoSell = {}
     AutoSell.__index = AutoSell
@@ -1056,41 +1067,6 @@ __factories["Features/AutoSell"] = function()
     local function valueOf(parent, name, fallback)
         local object = parent and parent:FindFirstChild(name)
         return object and object.Value or fallback
-    end
-
-    local function canIsAccessible(player, canName, areaDoorConfig)
-        local required = {}
-        for unlockName, cans in pairs(areaDoorConfig.DOOR_AREAS or {}) do
-            for _, configuredCan in ipairs(cans) do
-                if configuredCan == canName then
-                    table.insert(required, unlockName)
-                end
-            end
-        end
-        if #required == 0 then return true end
-        local hiddenData = player:FindFirstChild("HiddenData")
-        local unlockedDoors = hiddenData and hiddenData:FindFirstChild("UnlockedDoors")
-        if not unlockedDoors then return false end
-        for _, unlockName in ipairs(required) do
-            if not unlockedDoors:FindFirstChild(unlockName) then return false end
-        end
-        return true
-    end
-
-    local function nearestBin(player, position, areaDoorConfig)
-        local zones = Workspace:FindFirstChild("SellZones")
-        if not zones then return nil end
-        local best, bestDistance
-        for _, can in ipairs(zones:GetChildren()) do
-            local object = can:FindFirstChild("Bin") or can:FindFirstChild("Part")
-            if object and object:IsA("BasePart") and canIsAccessible(player, can.Name, areaDoorConfig) then
-                local distance = (object.Position - position).Magnitude
-                if not bestDistance or distance < bestDistance then
-                    best, bestDistance = object, distance
-                end
-            end
-        end
-        return best
     end
 
     function AutoSell.new(onStatus)
@@ -1105,57 +1081,57 @@ __factories["Features/AutoSell"] = function()
         local playerData = player:FindFirstChild("PlayerData")
         local leaves = valueOf(playerData, "Leaves", 0)
         local maxHold = valueOf(playerData, "MaxHold", 0)
-        return leaves > 0 and maxHold > 0 and leaves >= maxHold * Config.FEATURES.SELL_AT_CAPACITY_RATIO
+        return leaves > 0 and maxHold > 0
+            and leaves >= maxHold * Config.FEATURES.SELL_AT_CAPACITY_RATIO
     end
 
-    function AutoSell:_trigger(player, generation, areaDoorConfig)
-        local character = player.Character
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-        if not root then return end
-        local bin = nearestBin(player, root.Position, areaDoorConfig)
-        if not bin then
-            self.onStatus("Venda: SellZones/Bin ausente")
-            return
-        end
+    function AutoSell:_requestSell(player, remote, generation)
+        local playerData = player:FindFirstChild("PlayerData")
+        local leavesBefore = valueOf(playerData, "Leaves", 0)
 
-        local original = root.CFrame
-        local leavesBefore = valueOf(player:FindFirstChild("PlayerData"), "Leaves", 0)
-        root.CFrame = bin.CFrame + Vector3.new(0, Config.FEATURES.SELL_TOUCH_OFFSET, 0)
-        self.onStatus("Auto Sell: acionando lixeira")
-        task.wait(Config.TIMING.SELL_TRIGGER_WAIT)
+        -- Nos oito ciclos capturados, SellVisuals encerra a venda com math.huge.
+        -- Usar somente esse marcador evita inventar os valores parciais calculados
+        -- a partir dos oito argumentos que o servidor envia ao cliente.
+        remote:FireServer(math.huge)
 
-        local deadline = os.clock() + Config.TIMING.SELL_TIMEOUT
-        while self.enabled and self.generation == generation and os.clock() < deadline do
-            local leavesNow = valueOf(player:FindFirstChild("PlayerData"), "Leaves", 0)
-            if leavesNow < leavesBefore and not player:GetAttribute("IsSelling") then
-                break
-            end
+        local deadline = os.clock() + Config.TIMING.SELL_CONFIRM_TIMEOUT
+        repeat
             task.wait(0.1)
-        end
+            local leavesNow = valueOf(playerData, "Leaves", 0)
+            if leavesNow < leavesBefore then
+                self.onStatus("Auto Sell: venda confirmada")
+                return true
+            end
+        until not self.enabled or self.generation ~= generation or os.clock() >= deadline
 
-        -- Sempre restaura a posicao, inclusive se o toggle for desligado durante a venda.
-        if root.Parent then
-            root.CFrame = original
+        if self.enabled and self.generation == generation then
+            self.onStatus("Auto Sell: servidor nao confirmou")
         end
+        return false
     end
 
     function AutoSell:_run(generation)
         local player = Players.LocalPlayer
-        local modules = ReplicatedStorage:WaitForChild("Modules", 10)
-        local configModule = modules and modules:WaitForChild("AreaDoorConfig", 10)
-        if not configModule then
-            self.onStatus("Venda: AreaDoorConfig ausente")
+        local remote = ReplicatedStorage:WaitForChild("SellLeavesEvent", 10)
+        if not remote or not remote:IsA("RemoteEvent") then
+            self.onStatus("Venda: SellLeavesEvent ausente")
             self:setEnabled(false)
             return
         end
-        local areaDoorConfig = require(configModule)
-        self.onStatus("Auto Sell ativo")
+
+        self.onStatus("Auto Sell remoto ativo")
         while self.enabled and self.generation == generation do
-            if not player:GetAttribute("IsSelling") and self:_shouldSell(player) then
-                local ok, message = pcall(function() self:_trigger(player, generation, areaDoorConfig) end)
-                if not ok then self.onStatus("Venda falhou: " .. tostring(message)) end
+            if self:_shouldSell(player) then
+                local ok, result = pcall(function()
+                    return self:_requestSell(player, remote, generation)
+                end)
+                if not ok then
+                    self.onStatus("Venda falhou: " .. tostring(result))
+                end
+                task.wait(Config.TIMING.SELL_RETRY_DELAY)
+            else
+                task.wait(Config.TIMING.SELL_POLL)
             end
-            task.wait(Config.TIMING.SELL_POLL)
         end
     end
 
@@ -1177,6 +1153,136 @@ __factories["Features/AutoSell"] = function()
     end
 
     return AutoSell
+end
+
+__factories["Features/AutoUpgrade"] = function()
+    local Config = __require("Config")
+
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    local AutoUpgrade = {}
+    AutoUpgrade.__index = AutoUpgrade
+
+    local TOOL_REQUIREMENTS = {
+        RakeSpeed = "hasRake",
+        RakeArea = "hasRake",
+        RakeRange = "hasRake",
+        BlowerRange = "hasLeafblower",
+        BlowerRadius = "hasLeafblower",
+        BlowerCooldown = "hasLeafblower",
+    }
+
+    local function valueOf(parent, name, fallback)
+        local object = parent and parent:FindFirstChild(name)
+        return object and object.Value or fallback
+    end
+
+    local function isUnlocked(playerData, upgradeName)
+        local requirement = TOOL_REQUIREMENTS[upgradeName]
+        return not requirement or valueOf(playerData, requirement, false) == true
+    end
+
+    function AutoUpgrade.new(onStatus)
+        return setmetatable({
+            enabled = false,
+            generation = 0,
+            onStatus = onStatus or function() end,
+        }, AutoUpgrade)
+    end
+
+
+    function AutoUpgrade:_findCheapest(player, manager)
+        local playerData = player:FindFirstChild("PlayerData")
+        local levels = playerData and playerData:FindFirstChild("UpgradeLevels")
+        local cash = valueOf(playerData, "Cash", 0)
+        if not levels then return nil end
+
+        local rebirth = valueOf(player:FindFirstChild("leaderstats"), "Rebirth", 0)
+        local maxLevel = manager.MAX_LEVEL or 5
+        local best
+        for _, upgradeName in ipairs(Config.FEATURES.UPGRADE_ORDER) do
+            local levelObject = levels:FindFirstChild(upgradeName .. "Level")
+            local level = levelObject and levelObject.Value or 1
+            local capacityAllowed = upgradeName ~= "Capacity" or rebirth == 0
+            if levelObject and level < maxLevel and capacityAllowed and isUnlocked(playerData, upgradeName) then
+                local cost = manager.GetModifiedCost(player, upgradeName, level)
+                if cost > 0 and cost <= cash and (not best or cost < best.cost) then
+                    best = {
+                        name = upgradeName,
+                        levelObject = levelObject,
+                        level = level,
+                        cost = cost,
+                    }
+                end
+            end
+        end
+        return best
+    end
+
+    function AutoUpgrade:_purchase(player, manager, remote, generation)
+        local candidate = self:_findCheapest(player, manager)
+        if not candidate then return false end
+
+        remote:FireServer(candidate.name)
+        local deadline = os.clock() + Config.TIMING.UPGRADE_CONFIRM_TIMEOUT
+        repeat
+            task.wait(0.1)
+            if candidate.levelObject.Value > candidate.level then
+                self.onStatus("Upgrade confirmado: " .. candidate.name)
+                return true
+            end
+        until not self.enabled or self.generation ~= generation or os.clock() >= deadline
+
+        if self.enabled and self.generation == generation then
+            self.onStatus("Upgrade nao confirmado: " .. candidate.name)
+        end
+        return false
+    end
+
+    function AutoUpgrade:_run(generation)
+        local player = Players.LocalPlayer
+        local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+        local modules = ReplicatedStorage:WaitForChild("Modules", 10)
+        local remote = remotes and remotes:WaitForChild("UpgradeRequest", 10)
+        local managerModule = modules and modules:WaitForChild("UpgradeManager", 10)
+        if not remote or not remote:IsA("RemoteEvent") or not managerModule then
+            self.onStatus("Upgrade: dependencias ausentes")
+            self:setEnabled(false)
+            return
+        end
+
+        local manager = require(managerModule)
+        self.onStatus("Auto Upgrade ativo")
+        while self.enabled and self.generation == generation do
+            local ok, result = pcall(function()
+                return self:_purchase(player, manager, remote, generation)
+            end)
+            if not ok then
+                self.onStatus("Upgrade falhou: " .. tostring(result))
+            end
+            task.wait(Config.TIMING.UPGRADE_POLL)
+        end
+    end
+
+    function AutoUpgrade:setEnabled(enabled)
+        enabled = enabled == true
+        if self.enabled == enabled then return end
+        self.enabled = enabled
+        self.generation += 1
+        if enabled then
+            local generation = self.generation
+            task.spawn(function() self:_run(generation) end)
+        else
+            self.onStatus("Auto Upgrade desativado")
+        end
+    end
+
+    function AutoUpgrade:stop()
+        self:setEnabled(false)
+    end
+
+    return AutoUpgrade
 end
 
 __factories["UI/Layout"] = function()
@@ -1773,7 +1879,6 @@ __factories["UI/ModernUI"] = function()
 
     local TABS = table.freeze({ "Main", "Visual", "Misc", "Settings" })
     local TWEEN_INFO = TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-    local WINDOW_TWEEN_INFO = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
     local THEME_ATTRIBUTE = "GOATHubTheme_"
     local THEME_PROPERTIES = table.freeze({
         "BackgroundColor3",
@@ -2346,12 +2451,6 @@ __factories["UI/ModernUI"] = function()
                 self.closeCallback()
             end
         end))
-        local function tweenWindow(instance, properties)
-            local tween = TweenService:Create(instance, WINDOW_TWEEN_INFO, properties)
-            tween:Play()
-            return tween
-        end
-
         local function setHeaderDetailsVisible(visible)
             titleLabel.Visible = visible
             subtitle.Visible = visible
@@ -2367,36 +2466,25 @@ __factories["UI/ModernUI"] = function()
             self.transitionBusy = true
             local left = frame.Position.X.Offset - self.layout.width / 2
             local top = frame.Position.Y.Offset - self.layout.height / 2
-            local headerTween = tweenWindow(frame, {
-                Size = UDim2.fromOffset(self.layout.baseWidth, self.layout.headerHeight),
-                Position = UDim2.fromOffset(
-                    frame.Position.X.Offset,
-                    top + self.layout.effectiveHeaderHeight / 2
-                ),
-            })
-            headerTween.Completed:Wait()
-            if self.destroyed then
-                return
-            end
+
+            -- O frame usa tamanho-base + UIScale. Animar ambos misturava pixels
+            -- renderizados e base, fazendo a janela crescer para a direita. A troca
+            -- atomica tambem impede que um toque curto pareca um gesto de hold.
+            self.dragState = "idle"
+            self.dragKind = nil
+            self.dragInput = nil
+            self.dragStart = nil
+            self.startCenter = nil
             self.collapsed = true
             self.tabBar.Visible = false
             self.pageHost.Visible = false
             setHeaderDetailsVisible(false)
-
-            tweenWindow(self.windowScale, { Scale = 1 })
-            tweenWindow(brand, {
-                Position = UDim2.fromScale(0.5, 0.5),
-                Size = UDim2.fromOffset(38, 38),
-            })
-            tweenWindow(self.frameCorner, { CornerRadius = UDim.new(0, 16) })
-            local logoTween = tweenWindow(frame, {
-                Size = UDim2.fromOffset(52, 52),
-                Position = UDim2.fromOffset(left + 26, top + 26),
-            })
-            logoTween.Completed:Wait()
-            if self.destroyed then
-                return
-            end
+            self.windowScale.Scale = 1
+            brand.Position = UDim2.fromScale(0.5, 0.5)
+            brand.Size = UDim2.fromOffset(38, 38)
+            self.frameCorner.CornerRadius = UDim.new(0, 16)
+            frame.Size = UDim2.fromOffset(52, 52)
+            frame.Position = UDim2.fromOffset(left + 26, top + 26)
             self.topBar.Size = UDim2.fromScale(1, 1)
             self.transitionBusy = false
             self:_applyLayout(false)
@@ -2423,53 +2511,31 @@ __factories["UI/ModernUI"] = function()
                 calculated.padding,
                 calculated.effectiveHeaderHeight
             )
-            local expandedTop = centerY - calculated.height / 2
-
-            tweenWindow(self.windowScale, { Scale = calculated.scale })
-            tweenWindow(brand, {
-                Position = UDim2.new(0, 28, 0.5, 0),
-                Size = UDim2.fromOffset(32, 32),
-            })
-            tweenWindow(self.frameCorner, { CornerRadius = UDim.new(0, 14) })
-            local headerTween = tweenWindow(frame, {
-                Size = UDim2.fromOffset(calculated.baseWidth, calculated.headerHeight),
-                Position = UDim2.fromOffset(
-                    centerX,
-                    expandedTop + calculated.effectiveHeaderHeight / 2
-                ),
-            })
-            headerTween.Completed:Wait()
-            if self.destroyed then
-                return
-            end
+            self.windowScale.Scale = calculated.scale
+            brand.Position = UDim2.new(0, 28, 0.5, 0)
+            brand.Size = UDim2.fromOffset(32, 32)
+            self.frameCorner.CornerRadius = UDim.new(0, 14)
+            frame.Size = UDim2.fromOffset(calculated.baseWidth, calculated.baseHeight)
+            frame.Position = UDim2.fromOffset(centerX, centerY)
             setHeaderDetailsVisible(true)
             self.topBar.Size = UDim2.new(1, 0, 0, calculated.headerHeight)
             self.tabBar.Visible = true
             self.pageHost.Visible = true
             self.collapsed = false
             self:selectPage(self.activePage)
-
-            local bodyTween = tweenWindow(frame, {
-                Size = UDim2.fromOffset(calculated.baseWidth, calculated.baseHeight),
-                Position = UDim2.fromOffset(centerX, centerY),
-            })
-            bodyTween.Completed:Wait()
-            if self.destroyed then
-                return
-            end
             self.transitionBusy = false
             self:_applyLayout(false)
         end
 
         table.insert(self.connections, minimizeButton.Activated:Connect(function()
-            task.spawn(collapseToLogo)
+            collapseToLogo()
         end))
         table.insert(self.connections, brand.Activated:Connect(function()
             if self.collapsed and os.clock() >= (self.suppressBrandUntil or 0) then
                 self.dragState = "idle"
                 self.dragKind = nil
                 self.dragInput = nil
-                task.spawn(expandFromLogo)
+                expandFromLogo()
             end
         end))
 
@@ -3097,6 +3163,7 @@ __factories["init"] = function()
     local AutoCollect = __require("Features/AutoCollect")
     local AutoSell = __require("Features/AutoSell")
     local AutoRebirth = __require("Features/AutoRebirth")
+    local AutoUpgrade = __require("Features/AutoUpgrade")
 
     local UI
     if Config.UI_STYLE == "Legacy" then
@@ -3156,31 +3223,32 @@ __factories["init"] = function()
         local visualPage = getPage("Visual")
         local miscPage = getPage("Misc")
         local settingsPage = getPage("Settings")
-        local legacyStatus
+        local statusLabel
 
         local function setStatus(message)
             if typeof(window.setStatus) == "function" then
                 window:setStatus(tostring(message))
-            elseif legacyStatus and legacyStatus.Parent then
-                legacyStatus.Text = tostring(message)
+            end
+            if statusLabel and statusLabel.Parent then
+                statusLabel.Text = tostring(message)
             end
         end
 
         contentItem(UI.section(mainPage, "AUTOMACAO"))
-        if Config.UI_STYLE == "Legacy" then
-            legacyStatus = contentItem(UI.info(mainPage, "Pronto", 38))
-        end
+        statusLabel = contentItem(UI.info(mainPage, "Pronto", 38))
 
         local controllers = {
             autoCollect = AutoCollect.new(setStatus),
             autoSell = AutoSell.new(setStatus),
             autoRebirth = AutoRebirth.new(setStatus),
+            autoUpgrade = AutoUpgrade.new(setStatus),
         }
         app.controllers = controllers
 
         local controls = {
             { key = "feature.autoCollect", label = "Auto Collect Leaves", controller = controllers.autoCollect },
             { key = "feature.autoSell", label = "Auto Sell (capacidade cheia)", controller = controllers.autoSell },
+            { key = "feature.autoUpgrade", label = "Auto Upgrade Items", controller = controllers.autoUpgrade },
             { key = "feature.autoRebirth", label = "Auto Rebirth", controller = controllers.autoRebirth },
         }
         for _, control in ipairs(controls) do
@@ -3193,7 +3261,7 @@ __factories["init"] = function()
         end
 
         contentItem(UI.section(mainPage, "COMPORTAMENTO"))
-        contentItem(UI.info(mainPage, "Collect usa os lotes reais de LeafData. Sell aciona a lixeira e deixa o protocolo visual original concluir. Rebirth so envia quando os requisitos locais aparecem completos.", 76))
+        contentItem(UI.info(mainPage, "Collect usa os lotes reais de LeafData. Sell usa o marcador remoto observado, sem teleporte. Upgrade compra o item disponivel mais barato. Rebirth so envia com os requisitos completos.", 82))
 
         contentItem(UI.section(visualPage, "VISUAL"))
         contentItem(UI.section(miscPage, "MISC"))
